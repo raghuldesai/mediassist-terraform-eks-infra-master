@@ -1,0 +1,1017 @@
+# MediBot — AI-Powered Patient Triage System
+# Complete Deployment Guide
+
+=======================================================================
+PHASE 1 — GITHUB REPOS + TOKEN
+=======================================================================
+
+Step 1 — Create GitHub Repos
+-----------------------------------------------------------------------
+Go to github.com → New Repository
+
+Repo 1:
+  Name: medibot-app
+  Visibility: Private
+  Initialize with README: Yes
+
+Repo 2:
+  Name: medibot-manifests
+  Visibility: Private
+  Initialize with README: Yes
+
+Why: Two separate repos follow GitOps pattern — Jenkins owns app repo
+     (CI), ArgoCD watches manifests repo (CD). Git is the single
+     source of truth for deployments.
+If not done: CI/CD conflicts, merge issues, unintended deployments.
+
+Step 2 — Create GitHub Personal Access Token
+-----------------------------------------------------------------------
+GitHub → Settings → Developer Settings
+→ Personal Access Tokens → Tokens (classic) → Generate new token
+
+  Note: medibot-token
+  Expiration: 90 days
+  Scopes: repo (all), workflow
+
+→ Generate → COPY AND SAVE (shown only once)
+
+Why: Jenkins needs this token to clone private repos and push image
+     tag updates to medibot-manifests.
+If not done: Every git operation in Jenkins pipeline fails.
+
+=======================================================================
+PHASE 2 — AWS ACCOUNT SETUP
+=======================================================================
+
+Step 3 — Create IAM User
+-----------------------------------------------------------------------
+AWS Console → IAM → Users → Create User
+  Username: medibot-admin
+  Attach policy: AdministratorAccess
+  → Create access key → Application outside AWS → Download CSV
+
+  SAVE: Access Key ID and Secret Access Key
+
+Why: Terraform needs these keys to create all AWS infrastructure.
+If not done: terraform apply fails with "no credentials" error.
+
+Step 4 — Create EC2 Key Pair
+-----------------------------------------------------------------------
+AWS Console → EC2 → Key Pairs → Create key pair
+  Name: medibot-key
+  Type: RSA
+  Format: .pem
+  → Create → Download medibot-key.pem
+
+chmod 400 medibot-key.pem
+
+Why: Terraform references key_name = "medibot-key" for all EC2s.
+     Must exist before terraform apply runs.
+If not done: terraform apply fails — "key pair does not exist".
+
+=======================================================================
+PHASE 3 — MANAGEMENT SERVER
+=======================================================================
+
+Step 5 — Create Management EC2
+-----------------------------------------------------------------------
+AWS Console → EC2 → Launch Instance
+  Name: medibot-mgmt
+  AMI: Ubuntu 22.04
+  Instance type: t2.medium
+  Storage: 30 GB
+  Key pair: medibot-key
+  Security group: allow SSH (port 22) from your IP
+  → Launch
+
+ssh -i medibot-key.pem ubuntu@<mgmt-public-ip>
+
+Why: Stable server inside AWS to run Terraform and kubectl. Avoids
+     losing progress if your local connection drops mid-apply.
+If not done: One network drop corrupts terraform state.
+
+Step 6 — Install Tools on Management Server
+-----------------------------------------------------------------------
+
+# AWS CLI
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+sudo apt install unzip -y
+unzip awscliv2.zip
+sudo ./aws/install
+aws --version
+
+# Configure AWS credentials
+aws configure
+  AWS Access Key ID     : <from Step 3 CSV>
+  AWS Secret Access Key : <from Step 3 CSV>
+  Default region        : ap-south-1
+  Default output format : json
+
+# Terraform
+sudo apt-get install -y gnupg software-properties-common curl
+curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt-get update && sudo apt-get install terraform -y
+terraform -version
+
+# kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+kubectl version --client
+
+# eksctl
+curl -sLO "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz"
+tar -xzf eksctl_$(uname -s)_amd64.tar.gz
+sudo mv eksctl /usr/local/bin
+eksctl version
+
+# Helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+
+# Git
+sudo apt install git -y
+
+Step 7 — Clone Terraform Repo and Deploy Infrastructure
+-----------------------------------------------------------------------
+
+git clone <YOUR TERRAFORM REPO>
+cd <YOUR TERRAFORM REPO>
+
+terraform init
+terraform plan
+terraform apply -auto-approve
+
+# Takes ~15 minutes. When done save all outputs:
+terraform output
+
+SAVE THESE:
+  jenkins_public_ip   = x.x.x.x
+  sonarqube_public_ip = x.x.x.x
+  nexus_public_ip     = x.x.x.x
+  eks_cluster_name    = medibot-cluster
+
+=======================================================================
+PHASE 4 — EKS SETUP
+=======================================================================
+
+Step 8 — Connect kubectl to EKS
+-----------------------------------------------------------------------
+
+aws eks --region ap-south-1 update-kubeconfig --name medibot-cluster
+kubectl get nodes
+# All 3 nodes should show Ready
+
+Step 9 — Create OIDC Provider
+-----------------------------------------------------------------------
+
+eksctl utils associate-iam-oidc-provider \
+  --region ap-south-1 \
+  --cluster medibot-cluster \
+  --approve
+
+Why: Required for ALB Controller to get AWS permissions via IRSA.
+If not done: ALB controller cannot create load balancers.
+
+Step 10 — Install AWS Load Balancer Controller
+-----------------------------------------------------------------------
+
+NOTE: Check for leftover resources from any previous attempt first:
+
+Optional steps to follow
+
+<!-- # Check for existing policy
+aws iam list-policies --scope Local | grep AWSLoadBalancerControllerIAMPolicy
+
+# Check for existing CloudFormation stack
+aws cloudformation list-stacks \
+  --region ap-south-1 \
+  --query "StackSummaries[?contains(StackName, 'eksctl-medibot')].[StackName,StackStatus]" \
+  --output table
+
+# If stack exists — disable termination protection and delete:
+aws cloudformation update-termination-protection \
+  --no-enable-termination-protection \
+  --stack-name <stack-name> \
+  --region ap-south-1 -->
+
+<!-- aws cloudformation delete-stack \
+  --stack-name <stack-name> \
+  --region ap-south-1
+
+aws cloudformation wait stack-delete-complete \
+  --stack-name <stack-name> \
+  --region ap-south-1 -->
+
+# Now proceed:
+
+curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+
+aws iam create-policy \
+  --policy-name AWSLoadBalancerControllerIAMPolicy \
+  --policy-document file://iam_policy.json
+
+eksctl create iamserviceaccount \
+  --cluster=medibot-cluster \
+  --namespace=kube-system \
+  --name=aws-load-balancer-controller \
+  --attach-policy-arn=arn:aws:iam::496203436083:policy/AWSLoadBalancerControllerIAMPolicy \
+  --approve \
+  --region ap-south-1
+
+helm repo add eks https://aws.github.io/eks-charts
+helm repo update
+
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=medibot-cluster \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set region=ap-south-1 \
+  --set vpcId=vpc-0fa074e862796da56
+
+# Verify — wait for READY 2/2
+kubectl get deployment -n kube-system aws-load-balancer-controller
+
+Why: Watches Ingress resources and automatically creates AWS ALBs.
+If not done: App unreachable from internet — no ALB created.
+
+Step 11 — Install cert-manager
+-----------------------------------------------------------------------
+
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.0/cert-manager.yaml
+
+kubectl get pods -n cert-manager
+# Wait until all 3 pods are Running
+
+=======================================================================
+PHASE 5 — ECR SETUP
+=======================================================================
+
+Step 12 — Create ECR Repository
+-----------------------------------------------------------------------
+
+aws ecr create-repository \
+  --repository-name medibot \
+  --region ap-south-1 \
+  --image-scanning-configuration scanOnPush=true
+
+# Save the repositoryUri:
+# 496203436083.dkr.ecr.ap-south-1.amazonaws.com/medibot
+
+Step 13 — Create IAM User for Jenkins ECR Push
+-----------------------------------------------------------------------
+AWS Console → IAM → Users → Create User
+  Username: medibot-jenkins-ecr
+  Attach policy: AmazonEC2ContainerRegistryFullAccess
+  → Create access key → Application outside AWS → Download CSV
+
+  SAVE: Access Key ID and Secret Access Key
+
+=======================================================================
+PHASE 6 — JENKINS SETUP
+=======================================================================
+
+Step 14 — SSH into Jenkins EC2
+-----------------------------------------------------------------------
+
+ssh -i medibot-key.pem ubuntu@<jenkins_public_ip>
+
+Step 15 — Install Java + Jenkins
+-----------------------------------------------------------------------
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install openjdk-17-jdk -y
+
+sudo wget -O /etc/apt/keyrings/jenkins-keyring.asc \
+  https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key
+echo "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc]" \
+  https://pkg.jenkins.io/debian-stable binary/ | sudo tee \
+  /etc/apt/sources.list.d/jenkins.list > /dev/null
+sudo apt update
+sudo apt install jenkins -y
+sudo systemctl start jenkins
+sudo systemctl enable jenkins
+
+Step 16 — Install Docker on Jenkins EC2
+-----------------------------------------------------------------------
+
+curl https://get.docker.com | bash
+sudo usermod -aG docker jenkins
+sudo usermod -aG docker ubuntu
+sudo systemctl restart docker
+sudo systemctl restart jenkins
+
+Step 17 — Install kubectl on Jenkins EC2
+-----------------------------------------------------------------------
+
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+kubectl version --client
+
+Step 18 — Install Trivy on Jenkins EC2
+-----------------------------------------------------------------------
+
+sudo apt-get install wget gnupg -y
+wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+sudo apt-get update
+sudo apt-get install trivy -y
+trivy --version
+
+Step 19 — Install AWS CLI on Jenkins EC2
+-----------------------------------------------------------------------
+
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+aws --version
+
+# Create symlink so jenkins user can find it
+sudo ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/bin/aws
+sudo -u jenkins aws --version
+
+Step 20 — Copy kubeconfig to Jenkins user
+-----------------------------------------------------------------------
+
+# On management EC2:
+cat ~/.kube/config
+
+# On Jenkins EC2:
+sudo mkdir -p /var/lib/jenkins/.kube
+sudo nano /var/lib/jenkins/.kube/config
+# Paste kubeconfig content → Ctrl+X → Y → Enter
+sudo chown -R jenkins:jenkins /var/lib/jenkins/.kube
+
+=======================================================================
+PHASE 7 — SONARQUBE SETUP
+=======================================================================
+
+Step 21 — Connect to SonarQube EC2 via SSM
+-----------------------------------------------------------------------
+AWS Console → EC2 → medibot-sonarqube → Connect → Session Manager → Connect
+
+Step 22 — Install SonarQube
+-----------------------------------------------------------------------
+
+sudo apt update
+curl https://get.docker.com | bash
+sudo usermod -aG docker ubuntu
+newgrp docker
+sudo systemctl start docker
+
+docker run -d --name sonarqube \
+  --restart always \
+  -p 9000:9000 \
+  sonarqube:lts-community
+
+docker logs sonarqube -f
+# Wait until: "SonarQube is operational"
+
+Step 23 — Configure SonarQube
+-----------------------------------------------------------------------
+Open browser: http://<sonarqube_public_ip>:9000
+Login: admin / admin → change password to: admin123
+
+Generate token:
+  Top right → My Account → Security
+  Name: jenkins-token
+  Type: Global Analysis Token
+  → Generate → COPY AND SAVE
+
+Configure webhook (IMPORTANT — without this pipeline hangs at Quality Gate):
+  SonarQube → Administration → Configuration → Webhooks → Create
+  Name: jenkins
+  URL: http://<jenkins_public_ip>:8080/sonarqube-webhook/
+  → Create
+
+=======================================================================
+PHASE 8 — NEXUS SETUP
+=======================================================================
+
+Step 24 — Connect to Nexus EC2 via SSM
+-----------------------------------------------------------------------
+AWS Console → EC2 → medibot-nexus → Connect → Session Manager → Connect
+
+Step 25 — Install Nexus
+-----------------------------------------------------------------------
+
+sudo apt update
+curl https://get.docker.com | bash
+sudo usermod -aG docker ubuntu
+newgrp docker
+sudo systemctl start docker
+
+docker run -d --name nexus \
+  --restart always \
+  -p 8081:8081 \
+  sonatype/nexus3
+
+docker logs nexus -f
+# Wait until: "Started Sonatype Nexus"
+
+Step 26 — Configure Nexus
+-----------------------------------------------------------------------
+Open browser: http://<nexus_public_ip>:8081
+
+Get initial password:
+  docker exec nexus cat /nexus-data/admin.password
+
+Login → Setup wizard → Set password to: nexus123
+
+Create repositories:
+  Settings → Repositories → Create Repository
+
+  1. maven2 (hosted) → Name: medibot-releases  → Version policy: Release
+  2. maven2 (hosted) → Name: medibot-snapshots → Version policy: Snapshot
+
+Create Nexus user for Jenkins:
+  Settings → Security → Users → Create
+  Username: jenkins
+  Password: Jenkins@Nexus123
+  Status: Active
+  Roles: nx-admin
+
+Step 27 — Update pom.xml with Nexus URLs
+-----------------------------------------------------------------------
+In medibot-app repo → pom.xml, replace NEXUS_PUBLIC_IP:
+
+  <url>http://<nexus_public_ip>:8081/repository/medibot-releases/</url>
+  <url>http://<nexus_public_ip>:8081/repository/medibot-snapshots/</url>
+
+Commit and push.
+
+=======================================================================
+PHASE 9 — JENKINS CONFIGURATION
+=======================================================================
+
+Step 28 — Open Jenkins and Initial Setup
+-----------------------------------------------------------------------
+http://<jenkins_public_ip>:8080
+
+Get initial password:
+  sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+
+Install suggested plugins → Create admin:
+  Username: admin
+  Password: admin123
+  Email: your-email@gmail.com
+
+Step 29 — Install Jenkins Plugins
+-----------------------------------------------------------------------
+Manage Jenkins → Plugins → Available Plugins
+
+Install:
+  - Pipeline Stage View
+  - SonarQube Scanner
+  - Docker Pipeline
+  - Docker
+  - Maven Integration
+  - Config File Provider
+  - Pipeline Maven Integration
+  - Kubernetes CLI
+  - AWS Credentials
+  - AWS Steps
+
+Restart Jenkins after install.
+
+Step 30 — Configure Tools
+-----------------------------------------------------------------------
+Manage Jenkins → Tools
+
+Maven:
+  Add Maven → Name: maven3
+  Install automatically: checked → Version: 3.9.6
+
+SonarQube Scanner:
+  Add SonarQube Scanner → Name: sonar-scanner
+  Install automatically: checked
+
+Save.
+
+Step 31 — Add All Credentials
+-----------------------------------------------------------------------
+Manage Jenkins → Credentials → System → Global → Add Credentials
+
+--- GitHub ---
+Kind: Username with password
+Username: <your-github-username>
+Password: <github-token from Step 2>
+ID: git
+
+--- SonarQube Token ---
+Kind: Secret text
+Secret: <token from Step 23>
+ID: sonar-token
+
+--- AWS (ECR Push) ---
+Kind: AWS Credentials
+Access Key ID: <from Step 13 CSV>
+Secret Access Key: <from Step 13 CSV>
+ID: aws-creds
+
+--- AWS Account ID ---
+Kind: Secret text
+Secret: <your 12-digit AWS account ID>
+ID: aws-account-id
+
+Step 32 — Configure SonarQube Server in Jenkins
+-----------------------------------------------------------------------
+Manage Jenkins → System → SonarQube servers
+
+Check: Environment variables
+Add SonarQube:
+  Name: sonar
+  Server URL: http://<sonarqube_public_ip>:9000
+  Authentication Token: sonar-token
+
+Save.
+
+Step 33 — Add Nexus Maven Settings
+-----------------------------------------------------------------------
+Manage Jenkins → Managed Files → Add a New Config
+  Type: Global Maven Settings XML
+  ID: medibot-nexus
+
+Content (paste ONLY this — delete all existing default content):
+<?xml version="1.0" encoding="UTF-8"?>
+<settings>
+  <servers>
+    <server>
+      <id>medibot-releases</id>
+      <username>jenkins</username>
+      <password>Jenkins@Nexus123</password>
+    </server>
+    <server>
+      <id>medibot-snapshots</id>
+      <username>jenkins</username>
+      <password>Jenkins@Nexus123</password>
+    </server>
+  </servers>
+</settings>
+
+NOTE: Nothing after </settings> — extra content causes "Non-parseable
+      settings" error and Maven deploy will fail.
+
+Submit.
+
+=======================================================================
+PHASE 10 — KUBERNETES RBAC
+=======================================================================
+
+Step 34 — Create Namespace + RBAC
+-----------------------------------------------------------------------
+
+kubectl create namespace webapps
+
+cat <<EOF | kubectl apply -f -
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins-sa
+  namespace: webapps
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jenkins-role
+  namespace: webapps
+rules:
+- apiGroups: ["", "apps", "autoscaling", "networking.k8s.io"]
+  resources: ["pods", "services", "deployments", "replicasets",
+              "secrets", "configmaps", "persistentvolumeclaims",
+              "horizontalpodautoscalers", "ingresses"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jenkins-rolebinding
+  namespace: webapps
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jenkins-role
+subjects:
+- kind: ServiceAccount
+  name: jenkins-sa
+  namespace: webapps
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jenkins-cluster-role
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "namespaces", "persistentvolumes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins-cluster-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jenkins-cluster-role
+subjects:
+- kind: ServiceAccount
+  name: jenkins-sa
+  namespace: webapps
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jenkins-token
+  namespace: webapps
+  annotations:
+    kubernetes.io/service-account.name: jenkins-sa
+type: kubernetes.io/service-account-token
+EOF
+
+Step 35 — Get Token + Add to Jenkins
+-----------------------------------------------------------------------
+
+kubectl describe secret jenkins-token -n webapps
+# Copy the long string after "token:"
+
+Jenkins → Credentials → Global → Add Credentials
+  Kind: Secret text
+  Secret: <paste token>
+  ID: k8s-token
+
+kubectl cluster-info
+# Save: https://XXXX.gr7.ap-south-1.eks.amazonaws.com
+
+=======================================================================
+PHASE 11 — ARGOCD SETUP
+=======================================================================
+
+Step 36 — Install ArgoCD
+-----------------------------------------------------------------------
+
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+kubectl get pods -n argocd -w
+# Wait until all pods Running
+
+kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+
+kubectl get svc argocd-server -n argocd
+# Copy EXTERNAL-IP
+
+kubectl get secret argocd-initial-admin-secret -n argocd \
+  -o jsonpath="{.data.password}" | base64 -d; echo
+
+Step 37 — Configure ArgoCD
+-----------------------------------------------------------------------
+Open: http://<argocd-EXTERNAL-IP>
+Login: admin / <password from above>
+Change password: User Info → Update Password → admin123
+
+Connect repo:
+  Settings → Repositories → Connect Repo
+  Method: HTTPS
+  URL: https://github.com/<YOUR-USERNAME>/medibot-manifests.git
+  Username: <github-username>
+  Password: <github-token>
+  → Connect
+
+Create Application:
+  Applications → New App
+  Name: medibot
+  Project: default
+  Sync Policy: Automatic
+    ✓ Prune Resources
+    ✓ Self Heal
+  Repo URL: https://github.com/<YOUR-USERNAME>/medibot-manifests.git
+  Revision: main
+  Path: .
+  Cluster URL: https://kubernetes.default.svc
+  Namespace: webapps
+  → Create
+
+NOTE: Path is "." — manifest files are in root of medibot-manifests repo.
+
+=======================================================================
+PHASE 12 — JENKINS PIPELINE JOB
+=======================================================================
+
+Step 38 — Create Pipeline Job
+-----------------------------------------------------------------------
+Jenkins → New Item
+  Name: medibot-ci
+  Type: Pipeline → OK
+
+  Build Triggers:
+    ✓ GitHub hook trigger for GITScm polling
+
+  Pipeline:
+    Definition: Pipeline script from SCM
+    SCM: Git
+    URL: https://github.com/<YOUR-USERNAME>/medibot-app.git
+    Credentials: git
+    Branch: */main
+    Script Path: Jenkinsfile
+
+Save.
+
+Step 39 — Setup GitHub Webhook
+-----------------------------------------------------------------------
+GitHub → medibot-app → Settings → Webhooks → Add webhook
+
+  Payload URL: http://<jenkins_public_ip>:8080/github-webhook/
+  Content type: application/json
+  Events: Just the push event
+  Active: checked
+
+→ Add webhook
+
+Step 40 — Run Pipeline First Time
+-----------------------------------------------------------------------
+Jenkins → medibot-ci → Build Now
+
+Watch stages:
+  Git Checkout     ✓
+  Compile          ✓
+  Test             ✓
+  Trivy FS Scan    ✓
+  SonarQube        ✓
+  Quality Gate     ✓
+  Build JAR        ✓
+  Publish Nexus    ✓
+  Docker Build     ✓
+  Trivy Image Scan ✓
+  Push to ECR      ✓
+  Update Manifests ✓
+
+ArgoCD detects change → deploys to EKS → app live.
+
+=======================================================================
+PHASE 13 — VERIFY
+=======================================================================
+
+Step 41 — Verify Pods
+-----------------------------------------------------------------------
+
+kubectl get pods -n webapps
+kubectl get svc -n webapps
+kubectl get ingress -n webapps
+kubectl logs -n webapps deployment/medibot --tail=50
+
+Step 42 — Access the application
+-----------------------------------------------------------------------
+Open in browser:
+  http://<ALB-address>            → MediBot UI
+  http://<ALB-address>/api/health → Returns {"status":"UP"}
+
+=======================================================================
+PHASE 14 — BEDROCK IAM PERMISSION
+=======================================================================
+
+Step 43 — Attach Bedrock Policy to EKS Node Role
+-----------------------------------------------------------------------
+
+NOTE: Required for AI triage to work. Without this every appointment
+      shows "AI service unavailable. Default triage applied."
+
+aws iam create-policy \
+  --policy-name medibot-bedrock-policy \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": "*"
+    }]
+  }'
+
+aws iam attach-role-policy \
+  --role-name medibot-eks-node-role \
+  --policy-arn arn:aws:iam::496203436083:policy/medibot-bedrock-policy
+
+kubectl rollout restart deployment/medibot -n webapps
+kubectl get pods -n webapps -w
+
+NOTE ON BEDROCK MODEL:
+  Only Amazon Nova models are active in ap-south-1.
+  Use the APAC inference profile in your ConfigMap:
+  BEDROCK_MODEL_ID: "apac.amazon.nova-lite-v1:0"
+  BEDROCK_REGION: "ap-south-1"
+
+  To check available inference profiles:
+  aws bedrock list-inference-profiles --region ap-south-1 \
+    --query 'inferenceProfileSummaries[?contains(inferenceProfileId, `nova`)].inferenceProfileId' \
+    --output table
+
+=======================================================================
+PHASE 15 — MONITORING
+=======================================================================
+
+Step 44 — Install Prometheus + Grafana
+-----------------------------------------------------------------------
+
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+cat > monitoring-values.yaml << 'EOF'
+prometheus:
+  prometheusSpec:
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: ebs-sc
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 5Gi
+
+grafana:
+  enabled: true
+  adminPassword: admin123
+  service:
+    type: LoadBalancer
+  persistence:
+    enabled: true
+    storageClassName: ebs-sc
+    size: 5Gi
+
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true
+EOF
+
+helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+  -f monitoring-values.yaml \
+  -n monitoring \
+  --create-namespace
+
+kubectl get pods -n monitoring -w
+
+NOTE: If Grafana LoadBalancer stays <pending>, patch the service:
+kubectl patch svc monitoring-grafana -n monitoring \
+  -p '{"metadata": {"annotations": {"service.beta.kubernetes.io/aws-load-balancer-type": "external", "service.beta.kubernetes.io/aws-load-balancer-scheme": "internet-facing"}}}'
+
+Step 45 — Access Grafana
+-----------------------------------------------------------------------
+
+kubectl get svc -n monitoring | grep grafana
+# Copy EXTERNAL-IP
+
+# Get password
+kubectl --namespace monitoring get secrets monitoring-grafana \
+  -o jsonpath="{.data.admin-password}" | base64 -d; echo
+
+Open: http://<grafana-EXTERNAL-IP>
+Login: admin / <password from above>
+
+Import dashboards:
+  + → Import → ID: 3119 → Import  (Kubernetes cluster overview)
+  + → Import → ID: 1860 → Import  (Node Exporter full)
+  + → Import → ID: 6417 → Import  (Pod details)
+
+=======================================================================
+PHASE 16 — DOMAIN + SSL SETUP
+=======================================================================
+
+Step 46 — Request ACM Certificate
+-----------------------------------------------------------------------
+AWS Console → Certificate Manager → Request certificate
+  → Request a public certificate
+  → Domain name: *.kirandevops.xyz
+  → Validation method: DNS validation → Request
+
+Add the CNAME record in Route53:
+  Route53 → kirandevops.xyz → Create record
+  Type: CNAME
+  Name: <CNAME name from ACM>
+  Value: <CNAME value from ACM>
+  → Save
+
+Wait until ACM status: Issued → Copy the Certificate ARN.
+
+Step 47 — Update ingress.yaml in medibot-manifests repo
+-----------------------------------------------------------------------
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: medibot-ingress
+  namespace: webapps
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: "<paste-ACM-ARN-here>"
+spec:
+  rules:
+  - host: medibot.kirandevops.xyz
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: medibot-service
+            port:
+              number: 80
+
+Commit → ArgoCD auto-syncs.
+
+Step 48 — Add Route53 A Record
+-----------------------------------------------------------------------
+Route53 → kirandevops.xyz → Create record
+
+  Record name: medibot
+  Record type: A
+  Alias: ON
+  Route traffic to: Alias to Application and Classic Load Balancer
+  Region: Asia Pacific (Mumbai)
+  Load balancer: <ALB address from kubectl get ingress -n webapps>
+  → Create records
+
+Step 49 — Test
+-----------------------------------------------------------------------
+Wait 5 minutes then open: https://medibot.kirandevops.xyz
+
+=======================================================================
+POST-DEPLOYMENT VERIFICATION
+=======================================================================
+
+kubectl get pods -n webapps
+kubectl get svc -n webapps
+kubectl get ingress -n webapps
+kubectl get application -n argocd
+kubectl get hpa -n webapps
+kubectl logs -n webapps deployment/medibot --tail=50
+kubectl logs -n webapps deployment/mysql --tail=20
+kubectl get pods -n monitoring
+kubectl get deployment -n kube-system aws-load-balancer-controller
+kubectl get nodes
+kubectl top nodes
+kubectl top pods -n webapps
+
+=======================================================================
+TROUBLESHOOTING
+=======================================================================
+
+Pods CrashLoopBackOff:
+  kubectl logs -n webapps <pod-name> --previous
+
+MySQL connection refused:
+  kubectl exec -n webapps deployment/medibot -- env | grep MYSQL
+
+AI triage not working:
+  Check Bedrock policy: aws iam list-attached-role-policies --role-name medibot-eks-node-role
+  Check model ID: kubectl exec -n webapps deployment/medibot -- env | grep BEDROCK
+  Use: apac.amazon.nova-lite-v1:0 in ConfigMap
+
+Jenkins can't push to ECR:
+  Verify aws-creds has AmazonEC2ContainerRegistryFullAccess
+  Check symlink: sudo ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/bin/aws
+
+SonarQube Quality Gate stuck at PENDING:
+  SonarQube → Administration → Configuration → Webhooks
+  URL: http://<jenkins_ip>:8080/sonarqube-webhook/
+
+Maven settings.xml parse error:
+  Ensure ONLY custom settings block in Managed Files — nothing after </settings>
+
+ArgoCD sync failing:
+  kubectl logs -n argocd deployment/argocd-repo-server --tail=30
+  Check Path field is "." not "manifests"
+
+ConfigMap change not reflecting in pods:
+  Force ArgoCD sync, then: kubectl rollout restart deployment/medibot -n webapps
+  Verify: kubectl exec -n webapps deployment/medibot -- env | grep BEDROCK
+
+=======================================================================
+DESTROY WHEN DONE — AVOID BILLS
+=======================================================================
+
+Step 1 — Terraform destroy:
+  cd medibot-app/01-terraform
+  terraform destroy -auto-approve
+
+Step 2 — Manually delete:
+  CloudFormation → delete stacks with eksctl-medibot-* in name
+  IAM → Roles → delete roles with eksctl-medibot-* in name
+  IAM → Policies → AWSLoadBalancerControllerIAMPolicy
+  IAM → Policies → medibot-bedrock-policy
+  IAM → Users → medibot-jenkins-ecr
+  ECR → medibot repository
+  EC2 → medibot-mgmt instance
+  EC2 → Key Pairs → medibot-key
+  Certificate Manager → *.kirandevops.xyz certificate
+
+
+=======================================================================
