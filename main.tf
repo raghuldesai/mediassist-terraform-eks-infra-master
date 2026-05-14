@@ -6,9 +6,9 @@ provider "aws" {
 # ------------------------------------------------------------------
 terraform {
   backend "s3" {
-    bucket         = "terra-testing1412"
-    key            = "base-infra.tfstate"
-    region         = "us-east-1"
+    bucket = "terra-testing1412"
+    key    = "base-infra.tfstate"
+    region = "us-east-1"
   }
 }
 resource "aws_vpc" "main" {
@@ -369,7 +369,7 @@ resource "aws_db_instance" "mysql" {
   identifier             = "medibot-mysql"
   engine                 = "mysql"
   engine_version         = "8.0"
-  instance_class         = "db.t3a.micro"
+  instance_class         = "db.t3.micro"
   allocated_storage      = 20
   db_name                = "medibotdb"
   username               = "admin"
